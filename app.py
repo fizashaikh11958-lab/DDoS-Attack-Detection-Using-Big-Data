@@ -17,9 +17,9 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import train_test_split
 
 # ---- Project credit (edit these 3 lines) ----
-STUDENT_NAME = "Your Name"
-ROLL_NO = "Your Roll No"
-CLASS_NAME = "Your Class"
+STUDENT_NAME = "Fiza Shaikh"
+ROLL_NO = "19048"
+CLASS_NAME = "TYBSc.IT"
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -257,6 +257,225 @@ def run_detection(path, model, chunk_size, total_rows, progress=None):
                 ip_type[(ip, t)] += int(cnt)
             atk_rows[["timestamp", "src_ip", "protocol", "dst_port", "fwd_packets",
                       "pkts_per_sec", "attack_type"]].to_csv(
+                ATTACK_FILE, mode="a", header=first, index=False)
+            first = False
+
+        if progress:
+            progress.progress(min(total / max(total_rows, 1), 1.0),
+                              text=f"Processed {total:,} flows...")
+
+    # REDUCE step: combine the small summaries
+    mdf = pd.DataFrame([(m, v[0], v[1]) for m, v in sorted(minute_counts.items())],
+                       columns=["minute", "Normal", "Attack"])
+    mdf["Total"] = mdf["Normal"] + mdf["Attack"]
+    mdf["Attack %"] = (mdf["Attack"] / mdf["Total"] * 100).round(1)
+
+    top = pd.DataFrame()
+    if ip_type:
+        ip_df = pd.DataFrame([(ip, t, c) for (ip, t), c in ip_type.items()],
+                             columns=["Source IP", "Attack type", "Flows"])
+        tot = ip_df.groupby("Source IP")["Flows"].sum()
+        main = (ip_df.sort_values("Flows", ascending=False)
+                .drop_duplicates("Source IP").set_index("Source IP")["Attack type"])
+        top = pd.DataFrame({"Attack flows": tot, "Main attack type": main})
+        top = top.sort_values("Attack flows", ascending=False).head(10)
+        top.index.name = "Source IP"
+        top = top.reset_index()
+
+    attacks = sum(v for k, v in type_counts.items() if k != "Normal")
+    secs = time.time() - start
+    return {"total": total, "attacks": int(attacks), "types": dict(type_counts),
+            "minutes": mdf, "top_ips": top, "seconds": secs,
+            "speed": int(total / max(secs, 0.001)),
+            "accuracy": (correct / labelled) if labelled else None}
+
+
+def attack_windows(mdf, threshold):
+    """Group consecutive minutes with a high attack share into attack windows."""
+    bad = mdf[(mdf["Attack %"] >= threshold) & (mdf["Total"] >= 50)].copy()
+    if bad.empty:
+        return pd.DataFrame()
+    bad["t"] = pd.to_datetime(bad["minute"])
+    wins, cur = [], None
+    for _, r in bad.iterrows():
+        if cur and (r["t"] - cur["end"]) == pd.Timedelta(minutes=1):
+            cur["end"] = r["t"]
+            cur["flows"] += int(r["Attack"])
+            cur["peak"] = max(cur["peak"], r["Attack %"])
+        else:
+            if cur:
+                wins.append(cur)
+            cur = {"start": r["t"], "end": r["t"], "flows": int(r["Attack"]), "peak": r["Attack %"]}
+    wins.append(cur)
+    return pd.DataFrame([{
+        "Start": w["start"].strftime("%H:%M"),
+        "End": (w["end"] + pd.Timedelta(minutes=1)).strftime("%H:%M"),
+        "Minutes": int((w["end"] - w["start"]) / pd.Timedelta(minutes=1)) + 1,
+        "Attack flows": w["flows"],
+        "Peak attack %": w["peak"],
+    } for w in wins])
+
+
+# ===== UI starts here =====================================================
+st.set_page_config(page_title="DDoS Detection", page_icon="🛡️", layout="wide")
+
+# ---- Loading screen (once) ----
+if "loaded" not in st.session_state:
+    splash = st.empty()
+    with splash.container():
+        st.markdown(
+            f"""
+            <div style="text-align:center; padding:70px 10px 10px 10px;">
+              <div style="font-size:70px;">🛡️</div>
+              <h1 style="margin-bottom:0;">DDoS Attack Detection</h1>
+              <p style="font-size:20px; opacity:0.7;">Using Big Data</p>
+              <hr style="width:50%; margin:25px auto;">
+              <p style="font-size:18px; margin-bottom:4px;">This project is made By</p>
+              <h2 style="margin:0;">{STUDENT_NAME}</h2>
+              <p style="font-size:18px;">Roll No: {ROLL_NO} &nbsp;|&nbsp; {CLASS_NAME}</p>
+            </div>""",
+            unsafe_allow_html=True)
+        bar = st.progress(0)
+        msg = st.empty()
+        for i, step in enumerate(["Starting Big Data engine...", "Loading machine learning model...",
+                                  "Preparing dashboard...", "Ready!"]):
+            msg.markdown(f"<p style='text-align:center'>{step}</p>", unsafe_allow_html=True)
+            bar.progress((i + 1) * 25)
+            time.sleep(0.7)
+    splash.empty()
+    st.session_state.loaded = True
+
+# ---- Sidebar ----
+st.sidebar.title("🛡️ DDoS Detector")
+st.sidebar.caption(f"Made by {STUDENT_NAME} | Roll No {ROLL_NO} | {CLASS_NAME}")
+chunk_size = st.sidebar.selectbox("Chunk size (rows read at a time)",
+                                  [10_000, 50_000, 100_000], index=1)
+threshold = st.sidebar.slider("Alert if attack traffic in a minute is above (%)", 10, 90, 40)
+
+st.title("🛡️ DDoS Attack Detection Using Big Data")
+st.caption("Reads a big traffic file in small chunks, detects DDoS attacks with machine learning, and raises alerts.")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📂 1. Big Data", "🤖 2. Model", "🔍 3. Detect DDoS", "ℹ️ How it works"])
+
+# ---- Tab 1: data ----
+with tab1:
+    st.subheader("Step 1: Get the traffic data")
+    mode = st.radio("Data source", ["Generate sample big data", "Upload my own CSV"], horizontal=True)
+
+    if mode.startswith("Generate"):
+        c1, c2 = st.columns(2)
+        total_rows = c1.slider("Number of traffic flows", 50_000, 500_000, 200_000, step=50_000)
+        attack_pct = c2.slider("Attack traffic (%)", 5, 50, 20)
+        if st.button("⚙️ Generate big dataset", type="primary"):
+            bar = st.progress(0, text="Starting...")
+            make_dataset(total_rows, attack_pct, progress=bar)
+            st.session_state.rows = count_rows(DATA_FILE)
+            st.session_state.pop("result", None)
+            bar.empty()
+            st.success("Dataset created!")
+    else:
+        st.caption("Required columns: " + ", ".join(FEATURES) +
+                   " (optional: timestamp, src_ip, label)")
+        up = st.file_uploader("Upload traffic CSV", type="csv")
+        if up is not None and st.button("Use this file", type="primary"):
+            with open(DATA_FILE, "wb") as f:
+                f.write(up.getbuffer())
+            head = pd.read_csv(DATA_FILE, nrows=5)
+            missing = [c for c in FEATURES if c not in head.columns]
+            if missing:
+                os.remove(DATA_FILE)
+                st.error("Missing columns: " + ", ".join(missing))
+            else:
+                st.session_state.rows = count_rows(DATA_FILE)
+                st.session_state.pop("result", None)
+                st.success("File loaded!")
+
+    if os.path.exists(DATA_FILE):
+        size_mb = os.path.getsize(DATA_FILE) / 1_000_000
+        m1, m2 = st.columns(2)
+        m1.metric("Flows (rows) in dataset", f"{st.session_state.get('rows', count_rows(DATA_FILE)):,}")
+        m2.metric("File size", f"{size_mb:.1f} MB")
+        st.write("**Preview (first 10 rows)**")
+        st.dataframe(pd.read_csv(DATA_FILE, nrows=10), hide_index=True)
+    else:
+        st.info("No dataset yet. Generate or upload one.")
+
+# ---- Tab 2: model ----
+with tab2:
+    st.subheader("Step 2: Machine learning model")
+    with st.spinner("Training Random Forest model (first time only)..."):
+        info = train_model()
+    a, b, c = st.columns(3)
+    a.metric("Model accuracy", f"{info['accuracy'] * 100:.2f}%")
+    b.metric("Training flows", f"{info['train_rows']:,}")
+    c.metric("Testing flows", f"{info['test_rows']:,}")
+    st.write("**Classes the model can detect:** " + ", ".join(LABELS.values()))
+    st.write("**Precision / Recall / F1 for each class**")
+    st.dataframe(info["report"])
+    st.write("**Confusion matrix**")
+    st.dataframe(info["cm"])
+    st.write("**Which features matter most?**")
+    st.bar_chart(info["importance"])
+
+# ---- Tab 3: detection ----
+with tab3:
+    st.subheader("Step 3: Detect DDoS attacks")
+    has_data = os.path.exists(DATA_FILE)
+    if not has_data:
+        st.info("Create or upload a dataset in the first tab.")
+    if st.button("▶ Start DDoS detection", type="primary", disabled=not has_data):
+        info = train_model()
+        total_rows = st.session_state.get("rows") or count_rows(DATA_FILE)
+        bar = st.progress(0, text="Reading data in chunks...")
+        st.session_state.result = run_detection(DATA_FILE, info["model"], chunk_size, total_rows, bar)
+        bar.empty()
+
+    res = st.session_state.get("result")
+    if res:
+        wins = attack_windows(res["minutes"], threshold)
+        pct = res["attacks"] / max(res["total"], 1) * 100
+        if len(wins):
+            st.error(f"🚨 DDoS ATTACK DETECTED! {len(wins)} attack window(s) found. "
+                     f"Peak attack traffic: {wins['Peak attack %'].max()}% of flows in a minute.")
+        elif res["attacks"]:
+            st.warning("⚠️ Some suspicious flows found, but no sustained DDoS attack window.")
+        else:
+            st.success("✅ No DDoS attack detected. Traffic looks normal.")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Flows analysed", f"{res['total']:,}")
+        c2.metric("Attack flows", f"{res['attacks']:,}", f"{pct:.1f}%", delta_color="off")
+        c3.metric("Time taken", f"{res['seconds']:.1f} s")
+        c4.metric("Speed", f"{res['speed']:,} flows/s")
+        if res["accuracy"] is not None:
+            st.caption(f"Detection accuracy on this file (labels available): {res['accuracy'] * 100:.2f}%")
+
+        st.write("**Traffic per minute (attack bursts show up as spikes)**")
+        st.line_chart(res["minutes"].set_index("minute")[["Normal", "Attack"]])
+
+        l, r = st.columns(2)
+        with l:
+            st.write("**Attack types detected**")
+            types = pd.Series({k: v for k, v in res["types"].items() if k != "Normal"})
+            if len(types):
+                st.bar_chart(types)
+            else:
+                st.write("None")
+        with r:
+            st.write("**Top attacker IPs (botnet)**")
+            if len(res["top_ips"]):
+                st.dataframe(res["top_ips"], hide_index=True)
+            else:
+                st.write("None")
+
+        st.write("**🚨 Attack windows**")
+        if len(wins):
+            st.dataframe(wins, hide_index=True)
+        else:
+            st.write("No attack windows above the alert threshold.")
+
+        if os.path.exists(ATTACK_FILE):
+            st.write("**Det                     "pkts_per_sec", "attack_type"]].to_csv(
                 ATTACK_FILE, mode="a", header=first, index=False)
             first = False
 
